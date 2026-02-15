@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>倉庫ピック予約 - 大阪アパレル倉庫</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #faf6f0; font-family: 'Noto Sans JP', sans-serif; color: #3d2b1f; }
+    button { font-family: inherit; }
+    input, textarea, select { font-family: inherit; }
+    input:focus, textarea:focus, select:focus { border-color: #c67a4a !important; outline: none; }
+    button:hover:not(:disabled) { filter: brightness(0.96); }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+    .toast { animation: fadeIn 0.25s ease; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    // ─── Constants (spreadsheet settings) ───
+    const PRODUCTS = [
+      { id: "quarter", name: "クォーター", requiredSlots: 1, durationMin: 60 },
+      { id: "half", name: "ハーフ", requiredSlots: 3, durationMin: 120 },
+      { id: "full", name: "フル", requiredSlots: 2, durationMin: 180 },
+      { id: "pick-guide-half", name: "ピック指導（ハーフ）", requiredSlots: 3, durationMin: 180 },
+      { id: "pick-guide-full", name: "ピック指導（フル）", requiredSlots: 2, durationMin: 240 },
+    ];
+
+    const DEFAULT_SETTINGS = {
+      maxCapacity: 6, openHour: 9, openMin: 0, closeHour: 19, closeMin: 0,
+      slotIntervalMin: 30, calendarMonths: 3, holidays: [],
+    };
+
+    const STORAGE_KEY = "pick-res-v2";
+    const SETTINGS_KEY = "pick-set-v2";
+    const DAYS_JP = ["日", "月", "火", "水", "木", "金", "土"];
+
+    // ─── Colors ───
+    const C = {
+      bg: "#faf6f0", card: "#fffcf8", border: "#e8ddd0", text: "#3d2b1f",
+      sub: "#7c6854", accent: "#c67a4a", accentLt: "#fdf0e6", ok: "#4a7c59",
+      okLt: "#e6f2e8", ng: "#c0392b", ngLt: "#fce4d6", warn: "#e8a835",
+      muted: "#bbb", sun: "#c0392b", sat: "#2980b9",
+    };
+
+    // ─── Utilities ───
+    const pad2 = (n) => String(n).padStart(2, "0");
+    const fmtDate = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+    const parseD = (s) => { const [y,m,d] = s.split("-").map(Number); return new Date(y,m-1,d); };
+    const fmtTime = (h, m) => `${pad2(h)}:${pad2(m)}`;
+    const timeToMin = (t) => { const [h,m] = t.split(":").map(Number); return h*60+m; };
+    const isToday = (s) => fmtDate(new Date()) === s;
+    const isPast = (s) => parseD(s) < new Date(new Date().toDateString());
+    const genId = () => Math.random().toString(36).substr(2, 9);
+
+    const getMonthDays = (year, month) => {
+      const first = new Date(year, month, 1);
+      const last = new Date(year, month + 1, 0);
+      const days = [];
+      for (let i = 0; i < first.getDay(); i++) days.push(null);
+      for (let d = 1; d <= last.getDate(); d++) days.push(d);
+      return days;
+    };
+
+    const genSlots = (s) => {
+      const slots = [];
+      let h = s.openHour, m = s.openMin;
+      const end = s.closeHour * 60 + s.closeMin;
+      while (h * 60 + m < end) {
+        slots.push({ hour: h, min: m, label: fmtTime(h, m) });
+        m += s.slotIntervalMin;
+        if (m >= 60) { h += Math.floor(m / 60); m %= 60; }
+      }
+      return slots;
+    };
+
+    const getOcc = (date, slotLabel, res) =>
+      res.filter(r => r.date === date && r.status === "confirmed").reduce((sum, r) => {
+        const s = timeToMin(r.startTime), e = timeToMin(r.endTime), t = timeToMin(slotLabel);
+        return t >= s && t < e ? sum + r.requiredSlots : sum;
+      }, 0);
+
+    const canBook = (date, start, prod, res, set) => {
+      const sMin = timeToMin(start), eMin = sMin + prod.durationMin;
+      if (eMin > set.closeHour * 60 + set.closeMin) return false;
+      for (let m = sMin; m < eMin; m += set.slotIntervalMin) {
+        const label = fmtTime(Math.floor(m/60), m%60);
+        if (getOcc(date, label, res) + prod.requiredSlots > set.maxCapacity) return false;
+      }
+      return true;
+    };
+
+    const getAvail = (dateStr, res, set) => {
+      const slots = genSlots(set);
+      let total = 0;
+      slots.forEach(s => { total += Math.max(0, set.maxCapacity - getOcc(dateStr, s.label, res)); });
+      return total / (slots.length * set.maxCapacity);
+    };
+
+    // ─── Storage (localStorage) ───
+    const load = (key, fb) => {
+      try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fb; } catch { return fb; }
+    };
+    const save = (key, data) => {
+      try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) { console.error(e); }
+    };
+
+    // ─── Shared styles ───
+    const inp = {
+      padding: "11px 14px", border: `1px solid ${C.border}`, borderRadius: 8,
+      fontSize: 14, background: C.card, color: C.text, outline: "none",
+      transition: "border-color 0.2s", width: "100%", boxSizing: "border-box",
+    };
+    const btn = {
+      padding: "12px 18px", border: "none", borderRadius: 8, fontSize: 14,
+      fontWeight: 600, cursor: "pointer", transition: "all 0.15s",
+    };
+
+    // ─── Toast ───
+    function Toast({ message, type, onClose }) {
+      useEffect(() => { const t = setTimeout(onClose, 2800); return () => clearTimeout(t); }, [onClose]);
+      const bg = type === "success" ? C.ok : type === "error" ? C.ng : C.sub;
+      return (
+        <div className="toast" style={{
+          position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)", zIndex: 1000,
+          padding: "12px 28px", borderRadius: 10, color: "#fff", fontWeight: 600, fontSize: 13,
+          background: bg, boxShadow: "0 6px 24px rgba(0,0,0,0.15)", whiteSpace: "nowrap",
+        }}>{message}</div>
+      );
+    }
+
+    // ─── Calendar ───
+    function Calendar({ selectedDate, onSelect, reservations, settings, currentMonth, setCurrentMonth }) {
+      const yr = currentMonth.getFullYear(), mo = currentMonth.getMonth();
+      const days = getMonthDays(yr, mo);
+      const maxD = new Date(); maxD.setMonth(maxD.getMonth() + settings.calendarMonths);
+      const canNext = new Date(yr, mo+1, 1) <= maxD;
+      const canPrev = new Date(yr, mo, 1) > new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+
+      return (
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+            <button onClick={() => canPrev && setCurrentMonth(new Date(yr, mo-1, 1))} disabled={!canPrev}
+              style={{ ...btn, padding: "6px 14px", background: canPrev ? C.border : "#f0ebe4", color: canPrev ? C.sub : C.muted }}>◀</button>
+            <span style={{ fontSize: 17, fontWeight: 700, letterSpacing: 1 }}>{yr}年 {mo+1}月</span>
+            <button onClick={() => canNext && setCurrentMonth(new Date(yr, mo+1, 1))} disabled={!canNext}
+              style={{ ...btn, padding: "6px 14px", background: canNext ? C.border : "#f0ebe4", color: canNext ? C.sub : C.muted }}>▶</button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3 }}>
+            {DAYS_JP.map((d, i) => (
+              <div key={d} style={{ textAlign: "center", fontSize: 11, fontWeight: 700, padding: "4px 0",
+                color: i === 0 ? C.sun : i === 6 ? C.sat : C.sub }}>{d}</div>
+            ))}
+            {days.map((day, i) => {
+              if (!day) return <div key={`e${i}`} />;
+              const ds = fmtDate(new Date(yr, mo, day));
+              const sel = selectedDate === ds, past = isPast(ds), today = isToday(ds);
+              const dow = new Date(yr, mo, day).getDay();
+              const hol = settings.holidays.includes(ds), dis = past || hol;
+              let dot = null;
+              if (!dis) {
+                const r = getAvail(ds, reservations, settings);
+                const dc = r <= 0 ? C.ng : r < 0.3 ? C.warn : C.ok;
+                dot = <div style={{ width: 6, height: 6, borderRadius: "50%", background: dc, marginTop: 2 }} />;
+              }
+              return (
+                <button key={day} onClick={() => !dis && onSelect(ds)} disabled={dis}
+                  style={{
+                    aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                    border: sel ? `2px solid ${C.accent}` : today ? `2px solid ${C.warn}` : "1px solid transparent",
+                    borderRadius: 8, background: sel ? C.accentLt : hol ? "#f0ebe4" : past ? "#f5f0ea" : C.card,
+                    color: dis ? C.muted : dow === 0 ? C.sun : dow === 6 ? C.sat : C.text,
+                    cursor: dis ? "default" : "pointer", fontSize: 14, fontWeight: sel || today ? 700 : 500,
+                    transition: "all 0.12s",
+                  }}>
+                  {day}
+                  {hol && <span style={{ fontSize: 7, color: C.muted }}>休</span>}
+                  {!hol && !past && dot}
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ display: "flex", gap: 14, justifyContent: "center", marginTop: 10, fontSize: 11, color: C.sub }}>
+            {[["空きあり", C.ok], ["残り少", C.warn], ["満員", C.ng]].map(([l, c]) => (
+              <span key={l} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ width: 8, height: 8, borderRadius: "50%", background: c, display: "inline-block" }} /> {l}
+              </span>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─── ProductPicker ───
+    function ProductPicker({ selected, onSelect }) {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+          <label style={{ fontSize: 13, fontWeight: 600, color: C.sub }}>① 商品を選択</label>
+          {PRODUCTS.map(p => {
+            const act = selected?.id === p.id;
+            return (
+              <button key={p.id} onClick={() => onSelect(p)}
+                style={{
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                  padding: "14px 16px", borderRadius: 10, textAlign: "left",
+                  border: act ? `2px solid ${C.accent}` : `1px solid ${C.border}`,
+                  background: act ? C.accentLt : C.card, cursor: "pointer", transition: "all 0.15s",
+                }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 15, color: C.text }}>{p.name}</div>
+                  <div style={{ fontSize: 12, color: C.sub, marginTop: 2 }}>
+                    所要 {p.durationMin}分 ／ {p.requiredSlots}人分枠
+                  </div>
+                </div>
+                {act && <span style={{ fontSize: 18, color: C.accent }}>✓</span>}
+              </button>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ─── TimeSlotPicker ───
+    function TimeSlotPicker({ date, product, reservations, settings, onSelect }) {
+      if (!date || !product)
+        return <p style={{ color: C.muted, textAlign: "center", padding: 16, fontSize: 13 }}>
+          {!date ? "② 日付を選択してください" : "① 商品を選択してください"}</p>;
+
+      const all = genSlots(settings);
+      const closeMin = settings.closeHour * 60 + settings.closeMin;
+      const valid = all.filter(s => s.hour * 60 + s.min + product.durationMin <= closeMin);
+      const endLabel = (s) => {
+        const e = s.hour * 60 + s.min + product.durationMin;
+        return fmtTime(Math.floor(e/60), e%60);
+      };
+
+      return (
+        <div>
+          <label style={{ fontSize: 13, fontWeight: 600, color: C.sub, marginBottom: 8, display: "block" }}>
+            ③ 時間帯を選択
+          </label>
+          <div style={{ fontSize: 12, color: C.sub, marginBottom: 10 }}>
+            {date}　{product.name}（{product.durationMin}分）
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
+            {valid.map(slot => {
+              const ok = canBook(date, slot.label, product, reservations, settings);
+              const occ = getOcc(date, slot.label, reservations);
+              const rem = settings.maxCapacity - occ;
+              return (
+                <button key={slot.label} onClick={() => ok && onSelect(slot.label)} disabled={!ok}
+                  style={{
+                    padding: "12px 10px", borderRadius: 8, textAlign: "center",
+                    border: `1px solid ${ok ? C.border : "#eee"}`,
+                    background: ok ? C.card : "#f5f0ea",
+                    cursor: ok ? "pointer" : "default", opacity: ok ? 1 : 0.5, transition: "all 0.15s",
+                  }}>
+                  <div style={{ fontWeight: 600, fontSize: 14, color: C.text, fontVariantNumeric: "tabular-nums" }}>
+                    {slot.label}〜{endLabel(slot)}
+                  </div>
+                  <div style={{ fontSize: 11, fontWeight: 600, marginTop: 4,
+                    color: !ok ? C.muted : rem <= 2 ? C.ng : C.ok }}>
+                    {ok ? `残り${rem}枠` : "予約不可"}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          {valid.length === 0 && <p style={{ textAlign: "center", color: C.muted, fontSize: 13, padding: 16 }}>空き枠がありません</p>}
+        </div>
+      );
+    }
+
+    // ─── BookingForm ───
+    function BookingForm({ date, startTime, product, onConfirm, onCancel }) {
+      const [name, setName] = useState("");
+      const [phone, setPhone] = useState("");
+      const [note, setNote] = useState("");
+      const eMin = timeToMin(startTime) + product.durationMin;
+      const endTime = fmtTime(Math.floor(eMin/60), eMin%60);
+      const ok = name.trim() && phone.trim();
+
+      return (
+        <div style={{ background: C.card, borderRadius: 12, padding: 20, border: `1px solid ${C.border}` }}>
+          <h3 style={{ margin: "0 0 6px", fontSize: 17 }}>予約確認</h3>
+          <div style={{ fontSize: 13, color: C.sub, marginBottom: 18, lineHeight: 1.7 }}>
+            <div>📅 {date}（{DAYS_JP[parseD(date).getDay()]}）</div>
+            <div>🕐 {startTime} 〜 {endTime}（{product.durationMin}分）</div>
+            <div>📦 {product.name}（{product.requiredSlots}人分枠を使用）</div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <input placeholder="お名前 *" value={name} onChange={e => setName(e.target.value)} style={inp} />
+            <input placeholder="電話番号 *" value={phone} onChange={e => setPhone(e.target.value)} type="tel" style={inp} />
+            <textarea placeholder="備考（任意）" value={note} onChange={e => setNote(e.target.value)} rows={2}
+              style={{ ...inp, resize: "vertical" }} />
+            <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+              <button onClick={onCancel} style={{ ...btn, flex: 1, background: C.border, color: C.sub }}>戻る</button>
+              <button disabled={!ok}
+                onClick={() => ok && onConfirm({ name: name.trim(), phone: phone.trim(), note: note.trim(),
+                  startTime, endTime, date, productId: product.id, productName: product.name,
+                  requiredSlots: product.requiredSlots, durationMin: product.durationMin })}
+                style={{ ...btn, flex: 2, color: "#fff", background: ok ? C.accent : C.border, cursor: ok ? "pointer" : "default" }}>
+                予約を確定する
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── ReservationList ───
+    function ReservationList({ reservations, onCancel }) {
+      const active = reservations.filter(r => r.status === "confirmed")
+        .sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
+      if (!active.length) return <p style={{ textAlign: "center", color: C.muted, padding: 30, fontSize: 14 }}>予約はありません</p>;
+
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {active.map(r => {
+            const past = isPast(r.date);
+            return (
+              <div key={r.id} style={{
+                padding: "14px 16px", borderRadius: 10, border: `1px solid ${C.border}`,
+                background: past ? "#f5f0ea" : C.card, opacity: past ? 0.65 : 1,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 15 }}>{r.date}（{DAYS_JP[parseD(r.date).getDay()]}）</div>
+                    <div style={{ fontSize: 13, color: C.sub, marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
+                      {r.startTime} 〜 {r.endTime}</div>
+                    <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>{r.productName}　／　{r.name}</div>
+                    {r.note && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>備考: {r.note}</div>}
+                  </div>
+                  {!past && (
+                    <button onClick={() => onCancel(r.id)}
+                      style={{ ...btn, padding: "7px 14px", fontSize: 12, background: C.ngLt, color: C.ng }}>取消</button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ─── AdminPanel ───
+    function AdminPanel({ reservations, settings, onSettingsChange, onDelete }) {
+      const [show, setShow] = useState(false);
+      const [loc, setLoc] = useState(settings);
+      const [holIn, setHolIn] = useState("");
+      const active = reservations.filter(r => r.status === "confirmed")
+        .sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
+
+      const doSave = () => { onSettingsChange(loc); setShow(false); };
+      const addHol = () => {
+        if (holIn && !loc.holidays.includes(holIn)) {
+          setLoc(s => ({ ...s, holidays: [...s.holidays, holIn].sort() }));
+          setHolIn("");
+        }
+      };
+      const rmHol = (d) => setLoc(s => ({ ...s, holidays: s.holidays.filter(h => h !== d) }));
+
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <h3 style={{ margin: 0, fontSize: 17 }}>管理パネル</h3>
+            <button onClick={() => setShow(!show)}
+              style={{ ...btn, padding: "8px 16px", fontSize: 12, background: C.border, color: C.sub }}>
+              {show ? "閉じる" : "⚙ 設定"}</button>
+          </div>
+
+          {show && (
+            <div style={{ background: "#f9f5ef", borderRadius: 10, padding: 18, border: `1px solid ${C.border}`,
+              display: "flex", flexDirection: "column", gap: 14 }}>
+              <div>
+                <label style={{ fontSize: 12, color: C.sub, display: "block", marginBottom: 4 }}>同時利用上限人数</label>
+                <input type="number" min={1} max={20} value={loc.maxCapacity}
+                  onChange={e => setLoc(s => ({ ...s, maxCapacity: parseInt(e.target.value) || 1 }))}
+                  style={{ ...inp, width: 80 }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 12, color: C.sub, display: "block", marginBottom: 4 }}>営業時間</label>
+                <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
+                  <input type="number" min={0} max={23} value={loc.openHour}
+                    onChange={e => setLoc(s => ({ ...s, openHour: parseInt(e.target.value) || 0 }))}
+                    style={{ ...inp, width: 50 }} />
+                  <span>:</span>
+                  <input type="number" min={0} max={59} step={30} value={loc.openMin}
+                    onChange={e => setLoc(s => ({ ...s, openMin: parseInt(e.target.value) || 0 }))}
+                    style={{ ...inp, width: 50 }} />
+                  <span style={{ margin: "0 4px" }}>〜</span>
+                  <input type="number" min={0} max={23} value={loc.closeHour}
+                    onChange={e => setLoc(s => ({ ...s, closeHour: parseInt(e.target.value) || 0 }))}
+                    style={{ ...inp, width: 50 }} />
+                  <span>:</span>
+                  <input type="number" min={0} max={59} step={30} value={loc.closeMin}
+                    onChange={e => setLoc(s => ({ ...s, closeMin: parseInt(e.target.value) || 0 }))}
+                    style={{ ...inp, width: 50 }} />
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: 12, color: C.sub, display: "block", marginBottom: 4 }}>カレンダー表示月数</label>
+                <input type="number" min={1} max={12} value={loc.calendarMonths}
+                  onChange={e => setLoc(s => ({ ...s, calendarMonths: parseInt(e.target.value) || 3 }))}
+                  style={{ ...inp, width: 55 }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 12, color: C.sub, display: "block", marginBottom: 4 }}>休業日</label>
+                <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                  <input type="date" value={holIn} onChange={e => setHolIn(e.target.value)} style={{ ...inp, flex: 1 }} />
+                  <button onClick={addHol} style={{ ...btn, padding: "8px 14px", fontSize: 12, background: C.accent, color: "#fff" }}>追加</button>
+                </div>
+                {loc.holidays.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {loc.holidays.map(h => (
+                      <span key={h} style={{ display: "inline-flex", alignItems: "center", gap: 4,
+                        padding: "4px 10px", borderRadius: 6, background: C.ngLt, fontSize: 12, color: C.ng }}>
+                        {h}
+                        <button onClick={() => rmHol(h)}
+                          style={{ background: "none", border: "none", color: C.ng, cursor: "pointer", fontSize: 14, padding: 0 }}>×</button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <button onClick={doSave} style={{ ...btn, background: C.ok, color: "#fff", marginTop: 4 }}>設定を保存</button>
+            </div>
+          )}
+
+          <div>
+            <h4 style={{ margin: "0 0 10px", fontSize: 13, color: C.sub }}>予約一覧（{active.length}件）</h4>
+            {!active.length ? (
+              <p style={{ textAlign: "center", color: C.muted, padding: 20, fontSize: 13 }}>予約はありません</p>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {active.map(r => (
+                  <div key={r.id} style={{
+                    display: "flex", justifyContent: "space-between", alignItems: "center",
+                    padding: "10px 14px", borderRadius: 8, border: `1px solid ${C.border}`,
+                    background: isPast(r.date) ? "#f5f0ea" : C.card, opacity: isPast(r.date) ? 0.5 : 1, fontSize: 13,
+                  }}>
+                    <div style={{ lineHeight: 1.6 }}>
+                      <span style={{ fontWeight: 600 }}>{r.date}</span>
+                      <span style={{ color: C.sub, margin: "0 6px" }}>{r.startTime}〜{r.endTime}</span>
+                      <br />
+                      <span style={{ color: C.muted, fontSize: 12 }}>{r.productName}　{r.name}　{r.phone}</span>
+                    </div>
+                    <button onClick={() => onDelete(r.id)}
+                      style={{ ...btn, padding: "5px 10px", fontSize: 11, background: C.ngLt, color: C.ng, flexShrink: 0 }}>削除</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Main App ───
+    function App() {
+      const [reservations, setReservations] = useState([]);
+      const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+      const [loading, setLoading] = useState(true);
+      const [toast, setToast] = useState(null);
+      const [tab, setTab] = useState("reserve");
+      const [selDate, setSelDate] = useState(null);
+      const [selProd, setSelProd] = useState(null);
+      const [selTime, setSelTime] = useState(null);
+      const [curMonth, setCurMonth] = useState(new Date());
+
+      useEffect(() => {
+        const r = load(STORAGE_KEY, []);
+        const s = load(SETTINGS_KEY, DEFAULT_SETTINGS);
+        setReservations(r);
+        setSettings({ ...DEFAULT_SETTINGS, ...s });
+        setLoading(false);
+      }, []);
+
+      const persist = (newRes) => { setReservations(newRes); save(STORAGE_KEY, newRes); };
+      const persistSet = (s) => { setSettings(s); save(SETTINGS_KEY, s); setToast({ message: "設定を保存しました", type: "success" }); };
+
+      const handleConfirm = (info) => {
+        persist([...reservations, { id: genId(), ...info, status: "confirmed", createdAt: new Date().toISOString() }]);
+        setSelTime(null); setSelDate(null); setSelProd(null);
+        setToast({ message: "予約が確定しました", type: "success" });
+        setTab("list");
+      };
+
+      const handleCancel = (id) => {
+        persist(reservations.map(r => r.id === id ? { ...r, status: "cancelled" } : r));
+        setToast({ message: "予約をキャンセルしました", type: "error" });
+      };
+
+      if (loading) return (
+        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", height: "100vh", background: C.bg, color: C.sub }}>読み込み中...</div>
+      );
+
+      const tabStyle = (key) => ({
+        flex: 1, padding: "11px 0", border: "none",
+        borderBottom: tab === key ? `3px solid ${C.accent}` : "3px solid transparent",
+        background: "transparent", color: tab === key ? C.accent : C.sub,
+        fontSize: 13, fontWeight: tab === key ? 700 : 500, cursor: "pointer", transition: "all 0.15s",
+      });
+
+      return (
+        <div style={{ maxWidth: 460, margin: "0 auto", minHeight: "100vh", background: C.bg }}>
+          {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+
+          <div style={{ padding: "24px 20px 0", textAlign: "center" }}>
+            <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, letterSpacing: 2 }}>📦 倉庫ピック予約</h1>
+            <p style={{ margin: "4px 0 0", fontSize: 12, color: C.sub }}>大阪アパレル倉庫　予約管理</p>
+          </div>
+
+          <div style={{ display: "flex", borderBottom: `1px solid ${C.border}`, margin: "16px 20px 0" }}>
+            <button onClick={() => { setTab("reserve"); setSelTime(null); }} style={tabStyle("reserve")}>予約する</button>
+            <button onClick={() => setTab("list")} style={tabStyle("list")}>予約一覧</button>
+            <button onClick={() => setTab("admin")} style={tabStyle("admin")}>管理</button>
+          </div>
+
+          <div style={{ padding: 20 }}>
+            {tab === "reserve" && (
+              selTime ? (
+                <BookingForm date={selDate} startTime={selTime} product={selProd}
+                  onConfirm={handleConfirm} onCancel={() => setSelTime(null)} />
+              ) : (
+                <>
+                  <ProductPicker selected={selProd} onSelect={p => { setSelProd(p); setSelTime(null); }} />
+                  <Calendar selectedDate={selDate} onSelect={d => { setSelDate(d); setSelTime(null); }}
+                    reservations={reservations} settings={settings} currentMonth={curMonth} setCurrentMonth={setCurMonth} />
+                  <TimeSlotPicker date={selDate} product={selProd} reservations={reservations}
+                    settings={settings} onSelect={setSelTime} />
+                </>
+              )
+            )}
+            {tab === "list" && <ReservationList reservations={reservations} onCancel={handleCancel} />}
+            {tab === "admin" && <AdminPanel reservations={reservations} settings={settings}
+              onSettingsChange={persistSet} onDelete={handleCancel} />}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
